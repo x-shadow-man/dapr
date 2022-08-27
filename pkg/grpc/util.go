@@ -13,9 +13,12 @@ limitations under the License.
 
 package grpc
 
-import commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
+import (
+	commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
+)
 
-func stateConsistencyToString(c commonv1pb.StateOptions_StateConsistency) string {
+//nolint:nosnakecase
+func stateConsistencyToString(c commonv1pb.StateOptions_StateConsistency) string { //nolint:nosnakecase
 	switch c {
 	case commonv1pb.StateOptions_CONSISTENCY_EVENTUAL:
 		return "eventual"
@@ -26,6 +29,7 @@ func stateConsistencyToString(c commonv1pb.StateOptions_StateConsistency) string
 	return ""
 }
 
+//nolint:nosnakecase
 func stateConcurrencyToString(c commonv1pb.StateOptions_StateConcurrency) string {
 	switch c {
 	case commonv1pb.StateOptions_CONCURRENCY_FIRST_WRITE:

@@ -24,13 +24,14 @@ import (
 	"strings"
 	"testing"
 
+	diagUtils "github.com/dapr/dapr/pkg/diagnostics/utils"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	diag "github.com/dapr/dapr/pkg/diagnostics"
 	"github.com/dapr/dapr/tests/e2e/utils"
 	kube "github.com/dapr/dapr/tests/platforms/kubernetes"
 	"github.com/dapr/dapr/tests/runner"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	"go.opencensus.io/trace/propagation"
 )
 
 type testCommandRequest struct {
@@ -65,6 +66,9 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	utils.SetupLogs("service_invocation")
+	utils.InitHTTPClient(false)
+
 	// These apps will be deployed for hellodapr test before starting actual test
 	// and will be cleaned up after all tests are finished automatically
 	testApps := []kube.AppDescription{
@@ -127,7 +131,6 @@ func TestMain(m *testing.M) {
 			Replicas:       1,
 			IngressEnabled: true,
 			MetricsEnabled: true,
-			Config:         "grpcproxyconfig",
 		},
 		{
 			AppName:        "grpcproxyserver",
@@ -137,7 +140,6 @@ func TestMain(m *testing.M) {
 			IngressEnabled: false,
 			MetricsEnabled: true,
 			AppProtocol:    "grpc",
-			Config:         "grpcproxyconfig",
 			AppPort:        50051,
 		},
 	}
@@ -172,8 +174,35 @@ var serviceinvocationTests = []struct {
 	},
 }
 
+var serviceinvocationPathTests = []struct {
+	in               string
+	remoteApp        string
+	appMethod        string
+	expectedResponse string
+}{
+	{
+		"Test call double encoded path",
+		"serviceinvocation-callee",
+		"path/value%252F123",
+		"/path/value%252F123",
+	},
+	{
+		"Test call encoded path",
+		"serviceinvocation-callee",
+		"path/value%2F123",
+		"/path/value%2F123",
+	},
+	{
+		"Test call normal path",
+		"serviceinvocation-callee",
+		"path/value/123",
+		"/path/value/123",
+	},
+}
+
 var moreServiceinvocationTests = []struct {
 	in               string
+	path             string
 	remoteApp        string
 	appMethod        string
 	expectedResponse string
@@ -181,32 +210,37 @@ var moreServiceinvocationTests = []struct {
 	// For descriptions, see corresponding methods in dapr/tests/apps/service_invocation/app.go
 	{
 		"Test HTTP to HTTP",
+		"httptohttptest",
 		"serviceinvocation-callee-1",
 		"httptohttptest",
 		"success",
 	},
 	{
 		"Test HTTP to gRPC",
+		"httptogrpctest",
 		"grpcapp",
 		"httptogrpctest",
 		"success",
 	},
 	{
 		"Test gRPC to HTTP",
+		"grpctohttptest",
 		"serviceinvocation-callee-1",
 		"grpctohttptest",
 		"success",
 	},
 	{
 		"Test gRPC to gRPC",
-		"grpcapp",
 		"grpctogrpctest",
+		"grpcapp",
+		"grpcToGrpcTest",
 		"success",
 	},
 }
 
 var crossNamespaceTests = []struct {
 	in               string
+	path             string
 	remoteApp        string
 	appMethod        string
 	expectedResponse string
@@ -214,26 +248,30 @@ var crossNamespaceTests = []struct {
 	// For descriptions, see corresponding methods in dapr/tests/apps/service_invocation/app.go
 	{
 		"Test HTTP to HTTP",
+		"httptohttptest",
 		"secondary-ns-http",
 		"httptohttptest",
 		"success",
 	},
 	{
 		"Test HTTP to gRPC",
+		"httptogrpctest",
 		"secondary-ns-grpc",
 		"httptogrpctest",
 		"success",
 	},
 	{
 		"Test gRPC to HTTP",
+		"grpctohttptest",
 		"secondary-ns-http",
 		"grpctohttptest",
 		"success",
 	},
 	{
 		"Test gRPC to gRPC",
-		"secondary-ns-grpc",
 		"grpctogrpctest",
+		"secondary-ns-grpc",
+		"grpcToGrpcTest",
 		"success",
 	},
 }
@@ -292,13 +330,38 @@ func TestServiceInvocation(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			url := fmt.Sprintf("http://%s/%s", externalURL, tt.appMethod)
+			url := fmt.Sprintf("http://%s/%s", externalURL, tt.path)
 
 			t.Logf("url is '%s'\n", url)
 			resp, err := utils.HTTPPost(
 				url,
 				body)
 
+			t.Log("checking err...")
+			require.NoError(t, err)
+
+			var appResp appResponse
+			t.Logf("unmarshalling..%s\n", string(resp))
+			err = json.Unmarshal(resp, &appResp)
+			require.NoError(t, err)
+			require.Equal(t, tt.expectedResponse, appResp.Message)
+		})
+	}
+
+	// make sure dapr do not auto unescape path
+	for _, tt := range serviceinvocationPathTests {
+		t.Run(tt.in, func(t *testing.T) {
+			body, err := json.Marshal(testCommandRequest{
+				RemoteApp: tt.remoteApp,
+				Method:    tt.appMethod,
+			})
+			require.NoError(t, err)
+
+			url := fmt.Sprintf("http://%s/%s", externalURL, tt.appMethod)
+			t.Logf("url is '%s'\n", url)
+			resp, err := utils.HTTPPost(
+				url,
+				body)
 			t.Log("checking err...")
 			require.NoError(t, err)
 
@@ -386,11 +449,11 @@ func TestHeaders(t *testing.T) {
 		t.Logf("unmarshalling..%s\n", string(resp))
 		err = json.Unmarshal(resp, &appResp)
 
-		var actualHeaders = map[string]string{}
+		actualHeaders := map[string]string{}
 		json.Unmarshal([]byte(appResp.Message), &actualHeaders)
-		var requestHeaders = map[string][]string{}
-		var responseHeaders = map[string][]string{}
-		var trailerHeaders = map[string][]string{}
+		requestHeaders := map[string][]string{}
+		responseHeaders := map[string][]string{}
+		trailerHeaders := map[string][]string{}
 		json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
 		json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
 		json.Unmarshal([]byte(actualHeaders["trailers"]), &trailerHeaders)
@@ -453,10 +516,10 @@ func TestHeaders(t *testing.T) {
 		t.Logf("unmarshalling..%s\n", string(resp))
 		err = json.Unmarshal(resp, &appResp)
 
-		var actualHeaders = map[string]string{}
+		actualHeaders := map[string]string{}
 		json.Unmarshal([]byte(appResp.Message), &actualHeaders)
-		var requestHeaders = map[string][]string{}
-		var responseHeaders = map[string][]string{}
+		requestHeaders := map[string][]string{}
+		responseHeaders := map[string][]string{}
 		json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
 		json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
 
@@ -503,10 +566,10 @@ func TestHeaders(t *testing.T) {
 		t.Logf("unmarshalling..%s\n", string(resp))
 		err = json.Unmarshal(resp, &appResp)
 
-		var actualHeaders = map[string]string{}
+		actualHeaders := map[string]string{}
 		json.Unmarshal([]byte(appResp.Message), &actualHeaders)
-		var requestHeaders = map[string][]string{}
-		var responseHeaders = map[string][]string{}
+		requestHeaders := map[string][]string{}
+		responseHeaders := map[string][]string{}
 		json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
 		json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
 
@@ -590,11 +653,11 @@ func TestHeaders(t *testing.T) {
 		t.Logf("unmarshalling..%s\n", string(resp))
 		err = json.Unmarshal(resp, &appResp)
 
-		var actualHeaders = map[string]string{}
+		actualHeaders := map[string]string{}
 		json.Unmarshal([]byte(appResp.Message), &actualHeaders)
-		var requestHeaders = map[string][]string{}
-		var responseHeaders = map[string][]string{}
-		var trailerHeaders = map[string][]string{}
+		requestHeaders := map[string][]string{}
+		responseHeaders := map[string][]string{}
+		trailerHeaders := map[string][]string{}
 		json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
 		json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
 		json.Unmarshal([]byte(actualHeaders["trailers"]), &trailerHeaders)
@@ -621,7 +684,7 @@ func TestHeaders(t *testing.T) {
 				t.Logf("received response grpc header..%s\n", traceContext)
 				assert.Equal(t, expectedEncodedTraceID, traceContext)
 				decoded, _ := base64.StdEncoding.DecodeString(traceContext)
-				gotSc, ok := propagation.FromBinary(decoded)
+				gotSc, ok := diagUtils.SpanContextFromBinary(decoded)
 
 				assert.True(t, ok)
 				assert.NotNil(t, gotSc)
@@ -653,10 +716,10 @@ func TestHeaders(t *testing.T) {
 		t.Logf("unmarshalling..%s\n", string(resp))
 		err = json.Unmarshal(resp, &appResp)
 
-		var actualHeaders = map[string]string{}
+		actualHeaders := map[string]string{}
 		json.Unmarshal([]byte(appResp.Message), &actualHeaders)
-		var requestHeaders = map[string][]string{}
-		var responseHeaders = map[string][]string{}
+		requestHeaders := map[string][]string{}
+		responseHeaders := map[string][]string{}
 		json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
 		json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
 
@@ -687,10 +750,10 @@ func TestHeaders(t *testing.T) {
 		t.Logf("unmarshalling..%s\n", string(resp))
 		err = json.Unmarshal(resp, &appResp)
 
-		var actualHeaders = map[string]string{}
+		actualHeaders := map[string]string{}
 		json.Unmarshal([]byte(appResp.Message), &actualHeaders)
-		var requestHeaders = map[string][]string{}
-		var responseHeaders = map[string][]string{}
+		requestHeaders := map[string][]string{}
+		responseHeaders := map[string][]string{}
 		json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
 		json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
 
@@ -708,7 +771,7 @@ func TestHeaders(t *testing.T) {
 				t.Logf("received response grpc header..%s\n", traceContext)
 				assert.Equal(t, expectedEncodedTraceID, traceContext)
 				decoded, _ := base64.StdEncoding.DecodeString(traceContext)
-				gotSc, ok := propagation.FromBinary(decoded)
+				gotSc, ok := diagUtils.SpanContextFromBinary(decoded)
 
 				assert.True(t, ok)
 				assert.NotNil(t, gotSc)
@@ -734,10 +797,10 @@ func verifyHTTPToHTTPTracing(t *testing.T, url string, expectedTraceID string) {
 	t.Logf("unmarshalling..%s\n", string(resp))
 	err = json.Unmarshal(resp, &appResp)
 
-	var actualHeaders = map[string]string{}
+	actualHeaders := map[string]string{}
 	json.Unmarshal([]byte(appResp.Message), &actualHeaders)
-	var requestHeaders = map[string][]string{}
-	var responseHeaders = map[string][]string{}
+	requestHeaders := map[string][]string{}
+	responseHeaders := map[string][]string{}
 	json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
 	json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
 
@@ -769,10 +832,10 @@ func verifyHTTPToHTTP(t *testing.T, hostIP string, hostname string, url string, 
 	t.Logf("unmarshalling..%s\n", string(resp))
 	err = json.Unmarshal(resp, &appResp)
 
-	var actualHeaders = map[string]string{}
+	actualHeaders := map[string]string{}
 	json.Unmarshal([]byte(appResp.Message), &actualHeaders)
-	var requestHeaders = map[string][]string{}
-	var responseHeaders = map[string][]string{}
+	requestHeaders := map[string][]string{}
+	responseHeaders := map[string][]string{}
 	json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
 	json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
 
@@ -1050,7 +1113,7 @@ func TestCrossNamespaceCases(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			url := fmt.Sprintf("http://%s/%s", externalURL, tt.appMethod)
+			url := fmt.Sprintf("http://%s/%s", externalURL, tt.path)
 
 			t.Logf("url is '%s'\n", url)
 			resp, err := utils.HTTPPost(

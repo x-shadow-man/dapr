@@ -15,7 +15,6 @@ package placement
 
 import (
 	"context"
-	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -25,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	"github.com/dapr/dapr/pkg/placement/raft"
@@ -32,34 +32,6 @@ import (
 )
 
 const testStreamSendLatency = 50 * time.Millisecond
-
-var testRaftServer *raft.Server
-
-// TestMain is executed only one time in the entire package to
-// start test raft server.
-func TestMain(m *testing.M) {
-	testRaftServer = raft.New("testnode", true, []raft.PeerInfo{
-		{
-			ID:      "testnode",
-			Address: "127.0.0.1:6060",
-		},
-	}, "")
-
-	testRaftServer.StartRaft(nil)
-
-	// Wait until test raft node become a leader.
-	for range time.Tick(200 * time.Millisecond) {
-		if testRaftServer.IsLeader() {
-			break
-		}
-	}
-
-	retVal := m.Run()
-
-	testRaftServer.Shutdown()
-
-	os.Exit(retVal)
-}
 
 func newTestPlacementServer(raftServer *raft.Server) (string, *Service, func()) {
 	testServer := NewPlacementService(raftServer)
@@ -81,8 +53,8 @@ func newTestPlacementServer(raftServer *raft.Server) (string, *Service, func()) 
 	return serverAddress, testServer, cleanUpFn
 }
 
-func newTestClient(serverAddress string) (*grpc.ClientConn, v1pb.Placement_ReportDaprStatusClient, error) {
-	conn, err := grpc.Dial(serverAddress, grpc.WithInsecure())
+func newTestClient(serverAddress string) (*grpc.ClientConn, v1pb.Placement_ReportDaprStatusClient, error) { //nolint:nosnakecase
+	conn, err := grpc.Dial(serverAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, nil, err
 	}

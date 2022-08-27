@@ -22,19 +22,19 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/gorilla/mux"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/anypb"
+
 	commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
 	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
-	"github.com/golang/protobuf/ptypes/any"
-
-	"google.golang.org/grpc"
-
-	"github.com/gorilla/mux"
+	"github.com/dapr/dapr/tests/apps/utils"
 )
 
 const (
-	appPort      = 3000
-	daprPort     = 3500
-	daprPortGRPC = 50001
+	appPort  = 3000
+	daprPort = 3500
 )
 
 type testCommandRequest struct {
@@ -61,6 +61,7 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(indexHandlerResponse{Message: "OK"})
 }
 
+//nolint:gosec
 func testHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Entered testHandler")
 	var requestBody testCommandRequest
@@ -110,6 +111,7 @@ func sendGRPC(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, message := range requestBody.Messages {
+		//nolint:gosec
 		body, _ := json.Marshal(&message)
 
 		log.Printf("Sending message: %s", body)
@@ -136,9 +138,9 @@ func getReceivedTopicsGRPC(w http.ResponseWriter, r *http.Request) {
 		Id: "bindinginputgrpc",
 		Message: &commonv1pb.InvokeRequest{
 			Method: "GetReceivedTopics",
-			Data:   &any.Any{},
+			Data:   &anypb.Any{},
 			HttpExtension: &commonv1pb.HTTPExtension{
-				Verb: commonv1pb.HTTPExtension_POST,
+				Verb: commonv1pb.HTTPExtension_POST, //nolint:nosnakecase
 			},
 		},
 	}
@@ -156,6 +158,9 @@ func getReceivedTopicsGRPC(w http.ResponseWriter, r *http.Request) {
 func appRouter() *mux.Router {
 	router := mux.NewRouter().StrictSlash(true)
 
+	// Log requests and their processing time
+	router.Use(utils.LoggerMiddleware)
+
 	router.HandleFunc("/", indexHandler).Methods("GET")
 	router.HandleFunc("/tests/send", testHandler).Methods("POST")
 	router.HandleFunc("/tests/sendGRPC", sendGRPC).Methods("POST")
@@ -171,7 +176,7 @@ func initGRPCClient() {
 	log.Printf("Connecting to dapr using url %s", url)
 	for retries := 10; retries > 0; retries-- {
 		var err error
-		grpcConn, err = grpc.Dial(url, grpc.WithInsecure())
+		grpcConn, err = grpc.Dial(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err == nil {
 			break
 		}
@@ -192,6 +197,5 @@ func main() {
 	initGRPCClient()
 
 	log.Printf("Hello Dapr - listening on http://localhost:%d", appPort)
-
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", appPort), appRouter()))
+	utils.StartServer(appPort, appRouter, true, false)
 }

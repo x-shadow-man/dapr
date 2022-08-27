@@ -33,10 +33,14 @@ var (
 	DefaultGRPCMonitoring = newGRPCMetrics()
 	// DefaultHTTPMonitoring holds default HTTP monitoring handlers and middlewares.
 	DefaultHTTPMonitoring = newHTTPMetrics()
+	// DefaultComponentMonitoring holds component specific metrics.
+	DefaultComponentMonitoring = newComponentMetrics()
+	// DefaultResiliencyMonitoring holds resiliency specific metrics.
+	DefaultResiliencyMonitoring = newResiliencyMetrics()
 )
 
 // InitMetrics initializes metrics.
-func InitMetrics(appID string) error {
+func InitMetrics(appID, namespace string) error {
 	if err := DefaultMonitoring.Init(appID); err != nil {
 		return err
 	}
@@ -46,6 +50,14 @@ func InitMetrics(appID string) error {
 	}
 
 	if err := DefaultHTTPMonitoring.Init(appID); err != nil {
+		return err
+	}
+
+	if err := DefaultComponentMonitoring.Init(appID, namespace); err != nil {
+		return err
+	}
+
+	if err := DefaultResiliencyMonitoring.Init(appID); err != nil {
 		return err
 	}
 

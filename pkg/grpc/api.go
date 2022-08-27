@@ -15,15 +15,20 @@ package grpc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"sync"
+	"time"
+
+	"github.com/dapr/components-contrib/lock"
+	lockLoader "github.com/dapr/dapr/pkg/components/lock"
+	"github.com/dapr/dapr/pkg/version"
 
 	"github.com/dapr/components-contrib/configuration"
 
-	"github.com/golang/protobuf/ptypes/empty"
-	jsoniter "github.com/json-iterator/go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -31,19 +36,20 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/dapr/components-contrib/bindings"
-	contrib_metadata "github.com/dapr/components-contrib/metadata"
+	"github.com/dapr/components-contrib/contenttype"
+	contribMetadata "github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/pubsub"
 	"github.com/dapr/components-contrib/secretstores"
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/dapr/pkg/acl"
 	"github.com/dapr/dapr/pkg/actors"
-	components_v1alpha "github.com/dapr/dapr/pkg/apis/components/v1alpha1"
+	componentsV1alpha "github.com/dapr/dapr/pkg/apis/components/v1alpha1"
 	"github.com/dapr/dapr/pkg/channel"
-	state_loader "github.com/dapr/dapr/pkg/components/state"
+	stateLoader "github.com/dapr/dapr/pkg/components/state"
 	"github.com/dapr/dapr/pkg/concurrency"
 	"github.com/dapr/dapr/pkg/config"
 	diag "github.com/dapr/dapr/pkg/diagnostics"
-	diag_utils "github.com/dapr/dapr/pkg/diagnostics/utils"
+	diagUtils "github.com/dapr/dapr/pkg/diagnostics/utils"
 	"github.com/dapr/dapr/pkg/encryption"
 	"github.com/dapr/dapr/pkg/messages"
 	"github.com/dapr/dapr/pkg/messaging"
@@ -51,14 +57,19 @@ import (
 	commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
 	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
 	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
-	runtime_pubsub "github.com/dapr/dapr/pkg/runtime/pubsub"
+	"github.com/dapr/dapr/pkg/resiliency"
+	"github.com/dapr/dapr/pkg/resiliency/breaker"
+	runtimePubsub "github.com/dapr/dapr/pkg/runtime/pubsub"
 )
 
 const (
-	daprHTTPStatusHeader = "dapr-http-status"
+	daprHTTPStatusHeader  = "dapr-http-status"
+	daprRuntimeVersionKey = "daprRuntimeVersion"
 )
 
 // API is the gRPC interface for the Dapr gRPC API. It implements both the internal and external proto definitions.
+//
+//nolint:nosnakecase
 type API interface {
 	// DaprInternal Service methods
 	CallActor(ctx context.Context, in *internalv1pb.InternalInvokeRequest) (*internalv1pb.InternalInvokeResponse, error)
@@ -74,6 +85,7 @@ type API interface {
 	GetBulkSecret(ctx context.Context, in *runtimev1pb.GetBulkSecretRequest) (*runtimev1pb.GetBulkSecretResponse, error)
 	GetConfigurationAlpha1(ctx context.Context, in *runtimev1pb.GetConfigurationRequest) (*runtimev1pb.GetConfigurationResponse, error)
 	SubscribeConfigurationAlpha1(request *runtimev1pb.SubscribeConfigurationRequest, configurationServer runtimev1pb.Dapr_SubscribeConfigurationAlpha1Server) error
+	UnsubscribeConfigurationAlpha1(ctx context.Context, request *runtimev1pb.UnsubscribeConfigurationRequest) (*runtimev1pb.UnsubscribeConfigurationResponse, error)
 	SaveState(ctx context.Context, in *runtimev1pb.SaveStateRequest) (*emptypb.Empty, error)
 	QueryStateAlpha1(ctx context.Context, in *runtimev1pb.QueryStateRequest) (*runtimev1pb.QueryStateResponse, error)
 	DeleteState(ctx context.Context, in *runtimev1pb.DeleteStateRequest) (*emptypb.Empty, error)
@@ -86,9 +98,12 @@ type API interface {
 	UnregisterActorTimer(ctx context.Context, in *runtimev1pb.UnregisterActorTimerRequest) (*emptypb.Empty, error)
 	RegisterActorReminder(ctx context.Context, in *runtimev1pb.RegisterActorReminderRequest) (*emptypb.Empty, error)
 	UnregisterActorReminder(ctx context.Context, in *runtimev1pb.UnregisterActorReminderRequest) (*emptypb.Empty, error)
+	RenameActorReminder(ctx context.Context, in *runtimev1pb.RenameActorReminderRequest) (*emptypb.Empty, error)
 	GetActorState(ctx context.Context, in *runtimev1pb.GetActorStateRequest) (*runtimev1pb.GetActorStateResponse, error)
 	ExecuteActorStateTransaction(ctx context.Context, in *runtimev1pb.ExecuteActorStateTransactionRequest) (*emptypb.Empty, error)
 	InvokeActor(ctx context.Context, in *runtimev1pb.InvokeActorRequest) (*runtimev1pb.InvokeActorResponse, error)
+	TryLockAlpha1(ctx context.Context, in *runtimev1pb.TryLockRequest) (*runtimev1pb.TryLockResponse, error)
+	UnlockAlpha1(ctx context.Context, in *runtimev1pb.UnlockRequest) (*runtimev1pb.UnlockResponse, error)
 	// Gets metadata of the sidecar
 	GetMetadata(ctx context.Context, in *emptypb.Empty) (*runtimev1pb.GetMetadataResponse, error)
 	// Sets value in extended metadata of the sidecar
@@ -101,64 +116,204 @@ type api struct {
 	actor                      actors.Actors
 	directMessaging            messaging.DirectMessaging
 	appChannel                 channel.AppChannel
+	resiliency                 resiliency.Provider
 	stateStores                map[string]state.Store
 	transactionalStateStores   map[string]state.TransactionalStore
 	secretStores               map[string]secretstores.SecretStore
 	secretsConfiguration       map[string]config.SecretsScope
 	configurationStores        map[string]configuration.Store
-	configurationSubscribe     map[string]bool
+	configurationSubscribe     map[string]chan struct{} // store map[storeName||key1,key2] -> stopChan
 	configurationSubscribeLock sync.Mutex
-	pubsubAdapter              runtime_pubsub.Adapter
+	lockStores                 map[string]lock.Store
+	pubsubAdapter              runtimePubsub.Adapter
 	id                         string
 	sendToOutputBindingFn      func(name string, req *bindings.InvokeRequest) (*bindings.InvokeResponse, error)
 	tracingSpec                config.TracingSpec
 	accessControlList          *config.AccessControlList
 	appProtocol                string
 	extendedMetadata           sync.Map
-	components                 []components_v1alpha.Component
+	components                 []componentsV1alpha.Component
 	shutdown                   func()
+	getComponentsCapabilitesFn func() map[string][]string
+	daprRunTimeVersion         string
+}
+
+func (a *api) TryLockAlpha1(ctx context.Context, req *runtimev1pb.TryLockRequest) (*runtimev1pb.TryLockResponse, error) {
+	// 1. validate
+	if a.lockStores == nil || len(a.lockStores) == 0 {
+		err := status.Error(codes.FailedPrecondition, messages.ErrLockStoresNotConfigured)
+		apiServerLogger.Debug(err)
+		return &runtimev1pb.TryLockResponse{}, err
+	}
+	if req.ResourceId == "" {
+		err := status.Errorf(codes.InvalidArgument, messages.ErrResourceIDEmpty, req.StoreName)
+		return &runtimev1pb.TryLockResponse{}, err
+	}
+	if req.LockOwner == "" {
+		err := status.Errorf(codes.InvalidArgument, messages.ErrLockOwnerEmpty, req.StoreName)
+		return &runtimev1pb.TryLockResponse{}, err
+	}
+	if req.ExpiryInSeconds <= 0 {
+		err := status.Errorf(codes.InvalidArgument, messages.ErrExpiryInSecondsNotPositive, req.StoreName)
+		return &runtimev1pb.TryLockResponse{}, err
+	}
+	// 2. find lock component
+	store, ok := a.lockStores[req.StoreName]
+	if !ok {
+		return &runtimev1pb.TryLockResponse{}, status.Errorf(codes.InvalidArgument, messages.ErrLockStoreNotFound, req.StoreName)
+	}
+	// 3. convert request
+	compReq := TryLockRequestToComponentRequest(req)
+	// modify key
+	var err error
+	compReq.ResourceID, err = lockLoader.GetModifiedLockKey(compReq.ResourceID, req.StoreName, a.id)
+	if err != nil {
+		apiServerLogger.Debug(err)
+		return &runtimev1pb.TryLockResponse{}, err
+	}
+	// 4. delegate to the component
+	compResp, err := store.TryLock(compReq)
+	if err != nil {
+		apiServerLogger.Debug(err)
+		return &runtimev1pb.TryLockResponse{}, err
+	}
+	// 5. convert response
+	resp := TryLockResponseToGrpcResponse(compResp)
+	return resp, nil
+}
+
+func (a *api) UnlockAlpha1(ctx context.Context, req *runtimev1pb.UnlockRequest) (*runtimev1pb.UnlockResponse, error) {
+	// 1. validate
+	if a.lockStores == nil || len(a.lockStores) == 0 {
+		err := status.Error(codes.FailedPrecondition, messages.ErrLockStoresNotConfigured)
+		apiServerLogger.Debug(err)
+		return newInternalErrorUnlockResponse(), err
+	}
+	if req.ResourceId == "" {
+		err := status.Errorf(codes.InvalidArgument, messages.ErrResourceIDEmpty, req.StoreName)
+		return newInternalErrorUnlockResponse(), err
+	}
+	if req.LockOwner == "" {
+		err := status.Errorf(codes.InvalidArgument, messages.ErrLockOwnerEmpty, req.StoreName)
+		return newInternalErrorUnlockResponse(), err
+	}
+	// 2. find store component
+	store, ok := a.lockStores[req.StoreName]
+	if !ok {
+		return newInternalErrorUnlockResponse(), status.Errorf(codes.InvalidArgument, messages.ErrLockStoreNotFound, req.StoreName)
+	}
+	// 3. convert request
+	compReq := UnlockGrpcToComponentRequest(req)
+	// modify key
+	var err error
+	compReq.ResourceID, err = lockLoader.GetModifiedLockKey(compReq.ResourceID, req.StoreName, a.id)
+	if err != nil {
+		apiServerLogger.Debug(err)
+		return newInternalErrorUnlockResponse(), err
+	}
+	// 4. delegate to the component
+	compResp, err := store.Unlock(compReq)
+	if err != nil {
+		apiServerLogger.Debug(err)
+		return newInternalErrorUnlockResponse(), err
+	}
+	// 5. convert response
+	resp := UnlockResponseToGrpcResponse(compResp)
+	return resp, nil
+}
+
+func newInternalErrorUnlockResponse() *runtimev1pb.UnlockResponse {
+	return &runtimev1pb.UnlockResponse{
+		Status: runtimev1pb.UnlockResponse_INTERNAL_ERROR, //nolint:nosnakecase
+	}
+}
+
+func TryLockRequestToComponentRequest(req *runtimev1pb.TryLockRequest) *lock.TryLockRequest {
+	result := &lock.TryLockRequest{}
+	if req == nil {
+		return result
+	}
+	result.ResourceID = req.ResourceId
+	result.LockOwner = req.LockOwner
+	result.ExpiryInSeconds = req.ExpiryInSeconds
+	return result
+}
+
+func TryLockResponseToGrpcResponse(compResponse *lock.TryLockResponse) *runtimev1pb.TryLockResponse {
+	result := &runtimev1pb.TryLockResponse{}
+	if compResponse == nil {
+		return result
+	}
+	result.Success = compResponse.Success
+	return result
+}
+
+func UnlockGrpcToComponentRequest(req *runtimev1pb.UnlockRequest) *lock.UnlockRequest {
+	result := &lock.UnlockRequest{}
+	if req == nil {
+		return result
+	}
+	result.ResourceID = req.ResourceId
+	result.LockOwner = req.LockOwner
+	return result
+}
+
+func UnlockResponseToGrpcResponse(compResp *lock.UnlockResponse) *runtimev1pb.UnlockResponse {
+	result := &runtimev1pb.UnlockResponse{}
+	if compResp == nil {
+		return result
+	}
+	result.Status = runtimev1pb.UnlockResponse_Status(compResp.Status) //nolint:nosnakecase
+	return result
 }
 
 // NewAPI returns a new gRPC API.
 func NewAPI(
 	appID string, appChannel channel.AppChannel,
+	resiliency resiliency.Provider,
 	stateStores map[string]state.Store,
 	secretStores map[string]secretstores.SecretStore,
 	secretsConfiguration map[string]config.SecretsScope,
 	configurationStores map[string]configuration.Store,
-	pubsubAdapter runtime_pubsub.Adapter,
+	lockStores map[string]lock.Store,
+	pubsubAdapter runtimePubsub.Adapter,
 	directMessaging messaging.DirectMessaging,
 	actor actors.Actors,
 	sendToOutputBindingFn func(name string, req *bindings.InvokeRequest) (*bindings.InvokeResponse, error),
 	tracingSpec config.TracingSpec,
 	accessControlList *config.AccessControlList,
 	appProtocol string,
-	getComponentsFn func() []components_v1alpha.Component,
-	shutdown func()) API {
+	getComponentsFn func() []componentsV1alpha.Component,
+	shutdown func(),
+	getComponentsCapabilitiesFn func() map[string][]string,
+) API {
 	transactionalStateStores := map[string]state.TransactionalStore{}
 	for key, store := range stateStores {
 		if state.FeatureTransactional.IsPresent(store.Features()) {
 			transactionalStateStores[key] = store.(state.TransactionalStore)
 		}
 	}
-
 	return &api{
-		directMessaging:          directMessaging,
-		actor:                    actor,
-		id:                       appID,
-		appChannel:               appChannel,
-		pubsubAdapter:            pubsubAdapter,
-		stateStores:              stateStores,
-		transactionalStateStores: transactionalStateStores,
-		secretStores:             secretStores,
-		configurationStores:      configurationStores,
-		secretsConfiguration:     secretsConfiguration,
-		sendToOutputBindingFn:    sendToOutputBindingFn,
-		tracingSpec:              tracingSpec,
-		accessControlList:        accessControlList,
-		appProtocol:              appProtocol,
-		shutdown:                 shutdown,
-		configurationSubscribe:   map[string]bool{},
+		directMessaging:            directMessaging,
+		actor:                      actor,
+		id:                         appID,
+		resiliency:                 resiliency,
+		appChannel:                 appChannel,
+		pubsubAdapter:              pubsubAdapter,
+		stateStores:                stateStores,
+		transactionalStateStores:   transactionalStateStores,
+		secretStores:               secretStores,
+		configurationStores:        configurationStores,
+		configurationSubscribe:     make(map[string]chan struct{}),
+		lockStores:                 lockStores,
+		secretsConfiguration:       secretsConfiguration,
+		sendToOutputBindingFn:      sendToOutputBindingFn,
+		tracingSpec:                tracingSpec,
+		accessControlList:          accessControlList,
+		appProtocol:                appProtocol,
+		shutdown:                   shutdown,
+		getComponentsCapabilitesFn: getComponentsCapabilitiesFn,
+		daprRunTimeVersion:         version.Version(),
 	}
 }
 
@@ -176,7 +331,7 @@ func (a *api) CallLocal(ctx context.Context, in *internalv1pb.InternalInvokeRequ
 	if a.accessControlList != nil {
 		// An access control policy has been specified for the app. Apply the policies.
 		operation := req.Message().Method
-		var httpVerb commonv1pb.HTTPExtension_Verb
+		var httpVerb commonv1pb.HTTPExtension_Verb //nolint:nosnakecase
 		// Get the http verb in case the application protocol is http
 		if a.appProtocol == config.HTTPProtocol && req.Metadata() != nil && len(req.Metadata()) > 0 {
 			httpExt := req.Message().GetHttpExtension()
@@ -206,8 +361,14 @@ func (a *api) CallActor(ctx context.Context, in *internalv1pb.InternalInvokeRequ
 		return nil, status.Errorf(codes.InvalidArgument, messages.ErrInternalInvokeRequest, err.Error())
 	}
 
+	// We don't do resiliency here as it is handled in the API layer. See InvokeActor().
 	resp, err := a.actor.Call(ctx, req)
 	if err != nil {
+		// We have to remove the error to keep the body, so callers must re-inspect for the header in the actual response.
+		if errors.Is(err, actors.ErrDaprResponseHeader) {
+			return resp.Proto(), nil
+		}
+
 		err = status.Errorf(codes.Internal, messages.ErrActorInvoke, err)
 		return nil, err
 	}
@@ -242,14 +403,14 @@ func (a *api) PublishEvent(ctx context.Context, in *runtimev1pb.PublishEventRequ
 		return &emptypb.Empty{}, err
 	}
 
-	rawPayload, metaErr := contrib_metadata.IsRawPayload(in.Metadata)
+	rawPayload, metaErr := contribMetadata.IsRawPayload(in.Metadata)
 	if metaErr != nil {
 		err := status.Errorf(codes.InvalidArgument, messages.ErrMetadataGet, metaErr.Error())
 		apiServerLogger.Debug(err)
 		return &emptypb.Empty{}, err
 	}
 
-	span := diag_utils.SpanFromContext(ctx)
+	span := diagUtils.SpanFromContext(ctx)
 	// Populate W3C traceparent to cloudevent envelope
 	corID := diag.SpanContextToW3CString(span.SpanContext())
 	// Populate W3C tracestate to cloudevent envelope
@@ -263,7 +424,7 @@ func (a *api) PublishEvent(ctx context.Context, in *runtimev1pb.PublishEventRequ
 	data := body
 
 	if !rawPayload {
-		envelope, err := runtime_pubsub.NewCloudEvent(&runtime_pubsub.CloudEvent{
+		envelope, err := runtimePubsub.NewCloudEvent(&runtimePubsub.CloudEvent{
 			ID:              a.id,
 			Topic:           in.Topic,
 			DataContentType: in.DataContentType,
@@ -281,7 +442,7 @@ func (a *api) PublishEvent(ctx context.Context, in *runtimev1pb.PublishEventRequ
 		features := thepubsub.Features()
 		pubsub.ApplyMetadata(envelope, features, in.Metadata)
 
-		data, err = jsoniter.ConfigFastest.Marshal(envelope)
+		data, err = json.Marshal(envelope)
 		if err != nil {
 			err = status.Errorf(codes.InvalidArgument, messages.ErrPubsubCloudEventsSer, topic, pubsubName, err.Error())
 			apiServerLogger.Debug(err)
@@ -296,19 +457,25 @@ func (a *api) PublishEvent(ctx context.Context, in *runtimev1pb.PublishEventRequ
 		Metadata:   in.Metadata,
 	}
 
+	start := time.Now()
 	err := a.pubsubAdapter.Publish(&req)
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.PubsubEgressEvent(context.Background(), pubsubName, topic, err == nil, elapsed)
+
 	if err != nil {
 		nerr := status.Errorf(codes.Internal, messages.ErrPubsubPublishMessage, topic, pubsubName, err.Error())
-		if errors.As(err, &runtime_pubsub.NotAllowedError{}) {
+		if errors.As(err, &runtimePubsub.NotAllowedError{}) {
 			nerr = status.Errorf(codes.PermissionDenied, err.Error())
 		}
 
-		if errors.As(err, &runtime_pubsub.NotFoundError{}) {
+		if errors.As(err, &runtimePubsub.NotFoundError{}) {
 			nerr = status.Errorf(codes.NotFound, err.Error())
 		}
 		apiServerLogger.Debug(nerr)
 		return &emptypb.Empty{}, nerr
 	}
+
 	return &emptypb.Empty{}, nil
 }
 
@@ -323,31 +490,46 @@ func (a *api) InvokeService(ctx context.Context, in *runtimev1pb.InvokeServiceRe
 		return nil, status.Errorf(codes.Internal, messages.ErrDirectInvokeNotReady)
 	}
 
-	resp, err := a.directMessaging.Invoke(ctx, in.Id, req)
-	if err != nil {
-		err = status.Errorf(codes.Internal, messages.ErrDirectInvoke, in.Id, err)
-		return nil, err
-	}
+	policy := a.resiliency.EndpointPolicy(ctx, in.Id, fmt.Sprintf("%s:%s", in.Id, req.Message().Method))
+	var resp *invokev1.InvokeMethodResponse
+	var requestErr bool
+	respError := policy(func(ctx context.Context) (rErr error) {
+		requestErr = false
+		resp, rErr = a.directMessaging.Invoke(ctx, in.Id, req)
 
-	headerMD := invokev1.InternalMetadataToGrpcMetadata(ctx, resp.Headers(), true)
-
-	var respError error
-	if resp.IsHTTPResponse() {
-		errorMessage := []byte("")
-		if resp != nil {
-			_, errorMessage = resp.RawData()
+		if rErr != nil {
+			requestErr = true
+			rErr = status.Errorf(codes.Internal, messages.ErrDirectInvoke, in.Id, rErr)
+			return rErr
 		}
-		respError = invokev1.ErrorFromHTTPResponseCode(int(resp.Status().Code), string(errorMessage))
-		// Populate http status code to header
-		headerMD.Set(daprHTTPStatusHeader, strconv.Itoa(int(resp.Status().Code)))
-	} else {
-		respError = invokev1.ErrorFromInternalStatus(resp.Status())
-		// ignore trailer if appchannel uses HTTP
-		grpc.SetTrailer(ctx, invokev1.InternalMetadataToGrpcMetadata(ctx, resp.Trailers(), false))
+
+		headerMD := invokev1.InternalMetadataToGrpcMetadata(ctx, resp.Headers(), true)
+
+		// If the status is OK, respError will be nil.
+		var respError error
+		if resp.IsHTTPResponse() {
+			errorMessage := []byte("")
+			if resp != nil {
+				_, errorMessage = resp.RawData()
+			}
+			respError = invokev1.ErrorFromHTTPResponseCode(int(resp.Status().Code), string(errorMessage))
+			// Populate http status code to header
+			headerMD.Set(daprHTTPStatusHeader, strconv.Itoa(int(resp.Status().Code)))
+		} else {
+			respError = invokev1.ErrorFromInternalStatus(resp.Status())
+			// ignore trailer if appchannel uses HTTP
+			grpc.SetTrailer(ctx, invokev1.InternalMetadataToGrpcMetadata(ctx, resp.Trailers(), false))
+		}
+
+		grpc.SetHeader(ctx, headerMD)
+
+		return respError
+	})
+
+	// In this case, there was an error with the actual request or a resiliency policy stopped the request.
+	if requestErr || (errors.Is(respError, context.DeadlineExceeded) || breaker.IsErrorPermanent(respError)) {
+		return nil, respError
 	}
-
-	grpc.SetHeader(ctx, headerMD)
-
 	return resp.Message(), respError
 }
 
@@ -361,7 +543,12 @@ func (a *api) InvokeBinding(ctx context.Context, in *runtimev1pb.InvokeBindingRe
 	}
 
 	r := &runtimev1pb.InvokeBindingResponse{}
+	start := time.Now()
 	resp, err := a.sendToOutputBindingFn(in.Name, req)
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.OutputBindingEvent(context.Background(), in.Name, in.Operation, err == nil, elapsed)
+
 	if err != nil {
 		err = status.Errorf(codes.Internal, messages.ErrInvokeOutputBinding, in.Name, err.Error())
 		apiServerLogger.Debug(err)
@@ -390,7 +577,7 @@ func (a *api) GetBulkState(ctx context.Context, in *runtimev1pb.GetBulkStateRequ
 	// try bulk get first
 	reqs := make([]state.GetRequest, len(in.Keys))
 	for i, k := range in.Keys {
-		key, err1 := state_loader.GetModifiedStateKey(k, in.StoreName, a.id)
+		key, err1 := stateLoader.GetModifiedStateKey(k, in.StoreName, a.id)
 		if err1 != nil {
 			return &runtimev1pb.GetBulkStateResponse{}, err1
 		}
@@ -400,7 +587,18 @@ func (a *api) GetBulkState(ctx context.Context, in *runtimev1pb.GetBulkStateRequ
 		}
 		reqs[i] = r
 	}
-	bulkGet, responses, err := store.BulkGet(reqs)
+
+	start := time.Now()
+	var bulkGet bool
+	var responses []state.BulkGetResponse
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName, resiliency.Statestore)
+	err = policy(func(ctx context.Context) (rErr error) {
+		bulkGet, responses, rErr = store.BulkGet(reqs)
+		return rErr
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.StateInvoked(ctx, in.StoreName, diag.BulkGet, err == nil, elapsed)
 
 	// if store supports bulk get
 	if bulkGet {
@@ -409,7 +607,7 @@ func (a *api) GetBulkState(ctx context.Context, in *runtimev1pb.GetBulkStateRequ
 		}
 		for i := 0; i < len(responses); i++ {
 			item := &runtimev1pb.BulkStateItem{
-				Key:      state_loader.GetOriginalStateKey(responses[i].Key),
+				Key:      stateLoader.GetOriginalStateKey(responses[i].Key),
 				Data:     responses[i].Data,
 				Etag:     stringValueOrEmpty(responses[i].ETag),
 				Metadata: responses[i].Metadata,
@@ -427,9 +625,14 @@ func (a *api) GetBulkState(ctx context.Context, in *runtimev1pb.GetBulkStateRequ
 	for i := 0; i < n; i++ {
 		fn := func(param interface{}) {
 			req := param.(*state.GetRequest)
-			r, err := store.Get(req)
+			var r *state.GetResponse
+			err = policy(func(ctx context.Context) (rErr error) {
+				r, rErr = store.Get(req)
+				return rErr
+			})
+
 			item := &runtimev1pb.BulkStateItem{
-				Key: state_loader.GetOriginalStateKey(req.Key),
+				Key: stateLoader.GetOriginalStateKey(req.Key),
 			}
 			if err != nil {
 				item.Error = err.Error()
@@ -482,7 +685,7 @@ func (a *api) GetState(ctx context.Context, in *runtimev1pb.GetStateRequest) (*r
 		apiServerLogger.Debug(err)
 		return &runtimev1pb.GetStateResponse{}, err
 	}
-	key, err := state_loader.GetModifiedStateKey(in.Key, in.StoreName, a.id)
+	key, err := stateLoader.GetModifiedStateKey(in.Key, in.StoreName, a.id)
 	if err != nil {
 		return &runtimev1pb.GetStateResponse{}, err
 	}
@@ -494,7 +697,17 @@ func (a *api) GetState(ctx context.Context, in *runtimev1pb.GetStateRequest) (*r
 		},
 	}
 
-	getResponse, err := store.Get(&req)
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName, resiliency.Statestore)
+	var getResponse *state.GetResponse
+	err = policy(func(ctx context.Context) (rErr error) {
+		getResponse, rErr = store.Get(&req)
+		return rErr
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.StateInvoked(ctx, in.StoreName, diag.Get, err == nil, elapsed)
+
 	if err != nil {
 		err = status.Errorf(codes.Internal, messages.ErrStateGet, in.Key, in.StoreName, err.Error())
 		apiServerLogger.Debug(err)
@@ -530,15 +743,23 @@ func (a *api) SaveState(ctx context.Context, in *runtimev1pb.SaveStateRequest) (
 
 	reqs := []state.SetRequest{}
 	for _, s := range in.States {
-		key, err1 := state_loader.GetModifiedStateKey(s.Key, in.StoreName, a.id)
+		key, err1 := stateLoader.GetModifiedStateKey(s.Key, in.StoreName, a.id)
 		if err1 != nil {
 			return &emptypb.Empty{}, err1
 		}
 		req := state.SetRequest{
 			Key:      key,
 			Metadata: s.Metadata,
-			Value:    s.Value,
 		}
+
+		if contentType, ok := req.Metadata[contribMetadata.ContentType]; ok && contentType == contenttype.JSONContentType {
+			if err1 = json.Unmarshal(s.Value, &req.Value); err1 != nil {
+				return &emptypb.Empty{}, err1
+			}
+		} else {
+			req.Value = s.Value
+		}
+
 		if s.Etag != nil {
 			req.ETag = &s.Etag.Value
 		}
@@ -561,7 +782,15 @@ func (a *api) SaveState(ctx context.Context, in *runtimev1pb.SaveStateRequest) (
 		reqs = append(reqs, req)
 	}
 
-	err = store.BulkSet(reqs)
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName, resiliency.Statestore)
+	err = policy(func(ctx context.Context) error {
+		return store.BulkSet(reqs)
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.StateInvoked(ctx, in.StoreName, diag.Set, err == nil, elapsed)
+
 	if err != nil {
 		err = a.stateErrorResponse(err, messages.ErrStateSave, in.StoreName, err.Error())
 		apiServerLogger.Debug(err)
@@ -586,15 +815,31 @@ func (a *api) QueryStateAlpha1(ctx context.Context, in *runtimev1pb.QueryStateRe
 		return ret, err
 	}
 
+	if encryption.EncryptedStateStore(in.StoreName) {
+		err = status.Errorf(codes.Aborted, messages.ErrStateQuery, in.GetStoreName(), "cannot query encrypted store")
+		apiServerLogger.Debug(err)
+		return ret, err
+	}
+
 	var req state.QueryRequest
-	if err = jsoniter.Unmarshal([]byte(in.GetQuery()), &req.Query); err != nil {
+	if err = json.Unmarshal([]byte(in.GetQuery()), &req.Query); err != nil {
 		err = status.Errorf(codes.InvalidArgument, messages.ErrMalformedRequest, err.Error())
 		apiServerLogger.Debug(err)
 		return ret, err
 	}
 	req.Metadata = in.GetMetadata()
 
-	resp, err := querier.Query(&req)
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName, resiliency.Statestore)
+	var resp *state.QueryResponse
+	err = policy(func(ctx context.Context) (rErr error) {
+		resp, rErr = querier.Query(&req)
+		return rErr
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.StateInvoked(ctx, in.StoreName, diag.StateQuery, err == nil, elapsed)
+
 	if err != nil {
 		err = status.Errorf(codes.Internal, messages.ErrStateQuery, in.GetStoreName(), err.Error())
 		apiServerLogger.Debug(err)
@@ -604,22 +849,14 @@ func (a *api) QueryStateAlpha1(ctx context.Context, in *runtimev1pb.QueryStateRe
 		return ret, nil
 	}
 
-	encrypted := encryption.EncryptedStateStore(in.StoreName)
 	ret.Results = make([]*runtimev1pb.QueryStateItem, len(resp.Results))
 	ret.Token = resp.Token
 	ret.Metadata = resp.Metadata
 
 	for i := range resp.Results {
 		ret.Results[i] = &runtimev1pb.QueryStateItem{
-			Key:  state_loader.GetOriginalStateKey(resp.Results[i].Key),
+			Key:  stateLoader.GetOriginalStateKey(resp.Results[i].Key),
 			Data: resp.Results[i].Data,
-		}
-		if encrypted {
-			ret.Results[i].Data, err = encryption.TryDecryptValue(in.StoreName, resp.Results[i].Data)
-			if err != nil {
-				apiServerLogger.Debug("query error: %s", err)
-				ret.Results[i].Error = err.Error()
-			}
 		}
 	}
 
@@ -649,9 +886,9 @@ func (a *api) DeleteState(ctx context.Context, in *runtimev1pb.DeleteStateReques
 		return &emptypb.Empty{}, err
 	}
 
-	key, err := state_loader.GetModifiedStateKey(in.Key, in.StoreName, a.id)
+	key, err := stateLoader.GetModifiedStateKey(in.Key, in.StoreName, a.id)
 	if err != nil {
-		return &empty.Empty{}, err
+		return &emptypb.Empty{}, err
 	}
 	req := state.DeleteRequest{
 		Key:      key,
@@ -667,27 +904,35 @@ func (a *api) DeleteState(ctx context.Context, in *runtimev1pb.DeleteStateReques
 		}
 	}
 
-	err = store.Delete(&req)
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName, resiliency.Statestore)
+	err = policy(func(ctx context.Context) error {
+		return store.Delete(&req)
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.StateInvoked(ctx, in.StoreName, diag.Delete, err == nil, elapsed)
+
 	if err != nil {
 		err = a.stateErrorResponse(err, messages.ErrStateDelete, in.Key, err.Error())
 		apiServerLogger.Debug(err)
-		return &empty.Empty{}, err
+		return &emptypb.Empty{}, err
 	}
-	return &empty.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
-func (a *api) DeleteBulkState(ctx context.Context, in *runtimev1pb.DeleteBulkStateRequest) (*empty.Empty, error) {
+func (a *api) DeleteBulkState(ctx context.Context, in *runtimev1pb.DeleteBulkStateRequest) (*emptypb.Empty, error) {
 	store, err := a.getStateStore(in.StoreName)
 	if err != nil {
 		apiServerLogger.Debug(err)
-		return &empty.Empty{}, err
+		return &emptypb.Empty{}, err
 	}
 
 	reqs := make([]state.DeleteRequest, 0, len(in.States))
 	for _, item := range in.States {
-		key, err1 := state_loader.GetModifiedStateKey(item.Key, in.StoreName, a.id)
+		key, err1 := stateLoader.GetModifiedStateKey(item.Key, in.StoreName, a.id)
 		if err1 != nil {
-			return &empty.Empty{}, err1
+			return &emptypb.Empty{}, err1
 		}
 		req := state.DeleteRequest{
 			Key:      key,
@@ -704,7 +949,16 @@ func (a *api) DeleteBulkState(ctx context.Context, in *runtimev1pb.DeleteBulkSta
 		}
 		reqs = append(reqs, req)
 	}
-	err = store.BulkDelete(reqs)
+
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName, resiliency.Statestore)
+	err = policy(func(ctx context.Context) error {
+		return store.BulkDelete(reqs)
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.StateInvoked(ctx, in.StoreName, diag.BulkDelete, err == nil, elapsed)
+
 	if err != nil {
 		apiServerLogger.Debug(err)
 		return &emptypb.Empty{}, err
@@ -738,7 +992,17 @@ func (a *api) GetSecret(ctx context.Context, in *runtimev1pb.GetSecretRequest) (
 		Metadata: in.Metadata,
 	}
 
-	getResponse, err := a.secretStores[secretStoreName].GetSecret(req)
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, secretStoreName, resiliency.Secretstore)
+	var getResponse secretstores.GetSecretResponse
+	err := policy(func(ctx context.Context) (rErr error) {
+		getResponse, rErr = a.secretStores[secretStoreName].GetSecret(req)
+		return rErr
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.SecretInvoked(ctx, in.StoreName, diag.Get, err == nil, elapsed)
+
 	if err != nil {
 		err = status.Errorf(codes.Internal, messages.ErrSecretGet, req.Name, secretStoreName, err.Error())
 		apiServerLogger.Debug(err)
@@ -771,7 +1035,17 @@ func (a *api) GetBulkSecret(ctx context.Context, in *runtimev1pb.GetBulkSecretRe
 		Metadata: in.Metadata,
 	}
 
-	getResponse, err := a.secretStores[secretStoreName].BulkGetSecret(req)
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, secretStoreName, resiliency.Secretstore)
+	var getResponse secretstores.BulkGetSecretResponse
+	err := policy(func(ctx context.Context) (rErr error) {
+		getResponse, rErr = a.secretStores[secretStoreName].BulkGetSecret(req)
+		return rErr
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.SecretInvoked(ctx, in.StoreName, diag.BulkGet, err == nil, elapsed)
+
 	if err != nil {
 		err = status.Errorf(codes.Internal, messages.ErrBulkSecretGet, secretStoreName, err.Error())
 		apiServerLogger.Debug(err)
@@ -832,7 +1106,7 @@ func (a *api) ExecuteStateTransaction(ctx context.Context, in *runtimev1pb.Execu
 		req := inputReq.Request
 
 		hasEtag, etag := extractEtag(req)
-		key, err := state_loader.GetModifiedStateKey(req.Key, in.StoreName, a.id)
+		key, err := stateLoader.GetModifiedStateKey(req.Key, in.StoreName, a.id)
 		if err != nil {
 			return &emptypb.Empty{}, err
 		}
@@ -910,10 +1184,18 @@ func (a *api) ExecuteStateTransaction(ctx context.Context, in *runtimev1pb.Execu
 		}
 	}
 
-	err := transactionalStore.Multi(&state.TransactionalStateRequest{
-		Operations: operations,
-		Metadata:   in.Metadata,
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName, resiliency.Statestore)
+	err := policy(func(ctx context.Context) error {
+		return transactionalStore.Multi(&state.TransactionalStateRequest{
+			Operations: operations,
+			Metadata:   in.Metadata,
+		})
 	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.StateInvoked(ctx, in.StoreName, diag.StateTransaction, err == nil, elapsed)
+
 	if err != nil {
 		err = status.Errorf(codes.Internal, messages.ErrStateTransaction, err.Error())
 		apiServerLogger.Debug(err)
@@ -1000,6 +1282,24 @@ func (a *api) UnregisterActorReminder(ctx context.Context, in *runtimev1pb.Unreg
 	}
 
 	err := a.actor.DeleteReminder(ctx, req)
+	return &emptypb.Empty{}, err
+}
+
+func (a *api) RenameActorReminder(ctx context.Context, in *runtimev1pb.RenameActorReminderRequest) (*emptypb.Empty, error) {
+	if a.actor == nil {
+		err := status.Errorf(codes.Internal, messages.ErrActorRuntimeNotFound)
+		apiServerLogger.Debug(err)
+		return &emptypb.Empty{}, err
+	}
+
+	req := &actors.RenameReminderRequest{
+		OldName:   in.OldName,
+		ActorID:   in.ActorId,
+		ActorType: in.ActorType,
+		NewName:   in.NewName,
+	}
+
+	err := a.actor.RenameReminder(ctx, req)
 	return &emptypb.Empty{}, err
 }
 
@@ -1126,8 +1426,20 @@ func (a *api) InvokeActor(ctx context.Context, in *runtimev1pb.InvokeActorReques
 	req.WithActor(in.ActorType, in.ActorId)
 	req.WithRawData(in.Data, "")
 
-	resp, err := a.actor.Call(context.TODO(), req)
-	if err != nil {
+	// Unlike other actor calls, resiliency is handled here for invocation.
+	// This is due to actor invocation involving a lookup for the host.
+	// Having the retry here allows us to capture that and be resilient to host failure.
+	// Additionally, we don't perform timeouts at this level. This is because an actor
+	// should technically wait forever on the locking mechanism. If we timeout while
+	// waiting for the lock, we can also create a queue of calls that will try and continue
+	// after the timeout.
+	resp := invokev1.NewInvokeMethodResponse(500, "Blank request", nil)
+	policy := a.resiliency.ActorPreLockPolicy(ctx, in.ActorType, in.ActorId)
+	err := policy(func(ctx context.Context) (rErr error) {
+		resp, rErr = a.actor.Call(ctx, req)
+		return rErr
+	})
+	if err != nil && !errors.Is(err, actors.ErrDaprResponseHeader) {
 		err = status.Errorf(codes.Internal, messages.ErrActorInvoke, err)
 		apiServerLogger.Debug(err)
 		return &runtimev1pb.InvokeActorResponse{}, err
@@ -1160,31 +1472,52 @@ func (a *api) SetActorRuntime(actor actors.Actors) {
 }
 
 func (a *api) GetMetadata(ctx context.Context, in *emptypb.Empty) (*runtimev1pb.GetMetadataResponse, error) {
-	temp := make(map[string]string)
+	extendedMetadata := make(map[string]string)
 
 	// Copy synchronously so it can be serialized to JSON.
 	a.extendedMetadata.Range(func(key, value interface{}) bool {
-		temp[key.(string)] = value.(string)
+		extendedMetadata[key.(string)] = value.(string)
 		return true
 	})
+	extendedMetadata[daprRuntimeVersionKey] = a.daprRunTimeVersion
 	registeredComponents := make([]*runtimev1pb.RegisteredComponents, 0, len(a.components))
+	componentsCapabilities := a.getComponentsCapabilitesFn()
+	activeActorsCount := []*runtimev1pb.ActiveActorsCount{}
+	if a.actor != nil {
+		for _, actorTypeCount := range a.actor.GetActiveActorsCount(ctx) {
+			activeActorsCount = append(activeActorsCount, &runtimev1pb.ActiveActorsCount{
+				Type:  actorTypeCount.Type,
+				Count: int32(actorTypeCount.Count),
+			})
+		}
+	}
 
 	for _, comp := range a.components {
 		registeredComp := &runtimev1pb.RegisteredComponents{
-			Name:    comp.Name,
-			Version: comp.Spec.Version,
-			Type:    comp.Spec.Type,
+			Name:         comp.Name,
+			Version:      comp.Spec.Version,
+			Type:         comp.Spec.Type,
+			Capabilities: getOrDefaultCapabilities(componentsCapabilities, comp.Name),
 		}
 		registeredComponents = append(registeredComponents, registeredComp)
 	}
 	response := &runtimev1pb.GetMetadataResponse{
-		ExtendedMetadata:     temp,
+		Id:                   a.id,
+		ExtendedMetadata:     extendedMetadata,
 		RegisteredComponents: registeredComponents,
+		ActiveActorsCount:    activeActorsCount,
 	}
 	return response, nil
 }
 
-// Sets value in extended metadata of the sidecar.
+func getOrDefaultCapabilities(dict map[string][]string, key string) []string {
+	if val, ok := dict[key]; ok {
+		return val
+	}
+	return make([]string, 0)
+}
+
+// SetMetadata Sets value in extended metadata of the sidecar.
 func (a *api) SetMetadata(ctx context.Context, in *runtimev1pb.SetMetadataRequest) (*emptypb.Empty, error) {
 	a.extendedMetadata.Store(in.Key, in.Value)
 	return &emptypb.Empty{}, nil
@@ -1230,21 +1563,30 @@ func (a *api) GetConfigurationAlpha1(ctx context.Context, in *runtimev1pb.GetCon
 		Metadata: in.Metadata,
 	}
 
-	getResponse, err := store.Get(ctx, &req)
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName, resiliency.Configuration)
+	var getResponse *configuration.GetResponse
+	err = policy(func(ctx context.Context) (rErr error) {
+		getResponse, rErr = store.Get(ctx, &req)
+		return rErr
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.ConfigurationInvoked(ctx, in.StoreName, diag.Get, err == nil, elapsed)
+
 	if err != nil {
 		err = status.Errorf(codes.Internal, messages.ErrConfigurationGet, req.Keys, in.StoreName, err.Error())
 		apiServerLogger.Debug(err)
 		return &runtimev1pb.GetConfigurationResponse{}, err
 	}
 
-	cachedItems := make([]*commonv1pb.ConfigurationItem, 0)
-	for _, v := range getResponse.Items {
-		cachedItems = append(cachedItems, &commonv1pb.ConfigurationItem{
-			Key:      v.Key,
+	cachedItems := make(map[string]*commonv1pb.ConfigurationItem, len(getResponse.Items))
+	for k, v := range getResponse.Items {
+		cachedItems[k] = &commonv1pb.ConfigurationItem{
 			Metadata: v.Metadata,
 			Value:    v.Value,
 			Version:  v.Version,
-		})
+		}
 	}
 
 	response := &runtimev1pb.GetConfigurationResponse{
@@ -1257,48 +1599,70 @@ func (a *api) GetConfigurationAlpha1(ctx context.Context, in *runtimev1pb.GetCon
 type configurationEventHandler struct {
 	api          *api
 	storeName    string
-	serverStream runtimev1pb.Dapr_SubscribeConfigurationAlpha1Server
+	serverStream runtimev1pb.Dapr_SubscribeConfigurationAlpha1Server //nolint:nosnakecase
 }
 
 func (h *configurationEventHandler) updateEventHandler(ctx context.Context, e *configuration.UpdateEvent) error {
-	items := make([]*commonv1pb.ConfigurationItem, 0)
-	for _, v := range e.Items {
-		items = append(items, &commonv1pb.ConfigurationItem{
-			Key:      v.Key,
+	items := make(map[string]*commonv1pb.ConfigurationItem, len(e.Items))
+	for k, v := range e.Items {
+		items[k] = &commonv1pb.ConfigurationItem{
 			Value:    v.Value,
 			Version:  v.Version,
 			Metadata: v.Metadata,
-		})
+		}
 	}
 
 	if err := h.serverStream.Send(&runtimev1pb.SubscribeConfigurationResponse{
 		Items: items,
+		Id:    e.ID,
 	}); err != nil {
 		apiServerLogger.Debug(err)
 	}
 	return nil
 }
 
-func (a *api) SubscribeConfigurationAlpha1(request *runtimev1pb.SubscribeConfigurationRequest, configurationServer runtimev1pb.Dapr_SubscribeConfigurationAlpha1Server) error {
+func (a *api) SubscribeConfigurationAlpha1(request *runtimev1pb.SubscribeConfigurationRequest, configurationServer runtimev1pb.Dapr_SubscribeConfigurationAlpha1Server) error { //nolint:nosnakecase
 	store, err := a.getConfigurationStore(request.StoreName)
 	if err != nil {
-		err = status.Errorf(codes.Internal, fmt.Sprintf(messages.ErrConfigurationSubscribe, request.Keys, request.StoreName, err))
 		apiServerLogger.Debug(err)
 		return err
 	}
+	sort.Slice(request.Keys, func(i, j int) bool {
+		return request.Keys[i] < request.Keys[j]
+	})
 
-	subscribeKeys := request.Keys
-	unsubscribedKeys := make([]string, 0)
-	a.configurationSubscribeLock.Lock()
+	subscribeKeys := make([]string, 0)
 
-	for _, k := range subscribeKeys {
-		if _, ok := a.configurationSubscribe[fmt.Sprintf("%s||%s", request.StoreName, k)]; !ok {
-			unsubscribedKeys = append(unsubscribedKeys, k)
+	// TODO(@halspang) provide a switch to use just resiliency or this.
+	newCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// empty list means subscribing to all configuration keys
+	if len(request.Keys) == 0 {
+		getConfigurationReq := &runtimev1pb.GetConfigurationRequest{
+			StoreName: request.StoreName,
+			Keys:      []string{},
+			Metadata:  request.GetMetadata(),
 		}
+		resp, err2 := a.GetConfigurationAlpha1(newCtx, getConfigurationReq)
+		if err2 != nil {
+			err2 = status.Errorf(codes.Internal, fmt.Sprintf(messages.ErrConfigurationGet, request.Keys, request.StoreName, err2))
+			apiServerLogger.Debug(err2)
+			return err2
+		}
+
+		items := resp.GetItems()
+		for key := range items {
+			if _, ok := a.configurationSubscribe[fmt.Sprintf("%s||%s", request.StoreName, key)]; !ok {
+				subscribeKeys = append(subscribeKeys, key)
+			}
+		}
+	} else {
+		subscribeKeys = append(subscribeKeys, request.Keys...)
 	}
 
 	req := &configuration.SubscribeRequest{
-		Keys:     unsubscribedKeys,
+		Keys:     subscribeKeys,
 		Metadata: request.GetMetadata(),
 	}
 
@@ -1308,20 +1672,74 @@ func (a *api) SubscribeConfigurationAlpha1(request *runtimev1pb.SubscribeConfigu
 		serverStream: configurationServer,
 	}
 
-	ctx := context.TODO()
 	// TODO(@laurence) deal with failed subscription and retires
-	err = store.Subscribe(ctx, req, handler.updateEventHandler)
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(newCtx, request.StoreName, resiliency.Configuration)
+	var id string
+	err = policy(func(ctx context.Context) (rErr error) {
+		id, rErr = store.Subscribe(ctx, req, handler.updateEventHandler)
+		return rErr
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.ConfigurationInvoked(context.Background(), request.StoreName, diag.ConfigurationSubscribe, err == nil, elapsed)
+
 	if err != nil {
+		err = status.Errorf(codes.InvalidArgument, messages.ErrConfigurationSubscribe, req.Keys, request.StoreName, err.Error())
 		apiServerLogger.Debug(err)
-		a.configurationSubscribeLock.Unlock()
 		return err
 	}
-
-	for _, k := range unsubscribedKeys {
-		a.configurationSubscribe[fmt.Sprintf("%s||%s", request.StoreName, k)] = true
-	}
+	stop := make(chan struct{})
+	a.configurationSubscribeLock.Lock()
+	a.configurationSubscribe[id] = stop
 	a.configurationSubscribeLock.Unlock()
-
-	<-ctx.Done()
+	<-stop
 	return nil
+}
+
+func (a *api) UnsubscribeConfigurationAlpha1(ctx context.Context, request *runtimev1pb.UnsubscribeConfigurationRequest) (*runtimev1pb.UnsubscribeConfigurationResponse, error) {
+	store, err := a.getConfigurationStore(request.GetStoreName())
+	if err != nil {
+		apiServerLogger.Debug(err)
+		return &runtimev1pb.UnsubscribeConfigurationResponse{
+			Ok:      false,
+			Message: err.Error(),
+		}, err
+	}
+
+	a.configurationSubscribeLock.Lock()
+	defer a.configurationSubscribeLock.Unlock()
+
+	subscribeID := request.GetId()
+
+	stop, ok := a.configurationSubscribe[subscribeID]
+	if !ok {
+		return &runtimev1pb.UnsubscribeConfigurationResponse{
+			Ok: true,
+		}, nil
+	}
+	delete(a.configurationSubscribe, subscribeID)
+	close(stop)
+
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, request.StoreName, resiliency.Configuration)
+
+	start := time.Now()
+	err = policy(func(ctx context.Context) error {
+		return store.Unsubscribe(ctx, &configuration.UnsubscribeRequest{
+			ID: subscribeID,
+		})
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.ConfigurationInvoked(context.Background(), request.StoreName, diag.ConfigurationUnsubscribe, err == nil, elapsed)
+
+	if err != nil {
+		return &runtimev1pb.UnsubscribeConfigurationResponse{
+			Ok:      false,
+			Message: err.Error(),
+		}, err
+	}
+	return &runtimev1pb.UnsubscribeConfigurationResponse{
+		Ok: true,
+	}, nil
 }

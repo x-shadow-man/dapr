@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	grpc_retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
+	grpcRetry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
 	"github.com/pkg/errors"
 	yaml "gopkg.in/yaml.v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,24 +31,25 @@ import (
 )
 
 const (
-	operatorCallTimeout         = time.Second * 5
-	operatorMaxRetries          = 100
-	AllowAccess                 = "allow"
-	DenyAccess                  = "deny"
-	DefaultTrustDomain          = "public"
-	DefaultNamespace            = "default"
-	ActionPolicyApp             = "app"
-	ActionPolicyGlobal          = "global"
-	SpiffeIDPrefix              = "spiffe://"
-	HTTPProtocol                = "http"
-	GRPCProtocol                = "grpc"
-	ActorReentrancy     Feature = "Actor.Reentrancy"
-	ActorTypeMetadata   Feature = "Actor.TypeMetadata"
-	PubSubRouting       Feature = "PubSub.Routing"
-	StateEncryption     Feature = "State.Encryption"
+	operatorCallTimeout          = time.Second * 5
+	operatorMaxRetries           = 100
+	AllowAccess                  = "allow"
+	DenyAccess                   = "deny"
+	DefaultTrustDomain           = "public"
+	DefaultNamespace             = "default"
+	ActionPolicyApp              = "app"
+	ActionPolicyGlobal           = "global"
+	SpiffeIDPrefix               = "spiffe://"
+	HTTPProtocol                 = "http"
+	GRPCProtocol                 = "grpc"
+	Resiliency           Feature = "Resiliency"
+	NoDefaultContentType Feature = "ServiceInvocation.NoDefaultContentType"
+	AppHealthCheck       Feature = "AppHealthCheck"
 )
 
 type Feature string
+
+var noDefaultContentTypeValue = false
 
 // Configuration is an internal (and duplicate) representation of Dapr's Configuration CRD.
 type Configuration struct {
@@ -72,14 +73,14 @@ type AccessControlListPolicySpec struct {
 	DefaultAction       string
 	TrustDomain         string
 	Namespace           string
-	AppOperationActions map[string]AccessControlListOperationAction
+	AppOperationActions *Trie
 }
 
 // AccessControlListOperationAction is an in-memory access control list config per operation for fast lookup.
 type AccessControlListOperationAction struct {
-	VerbAction       map[string]string
-	OperationPostFix string
-	OperationAction  string
+	VerbAction      map[string]string
+	OperationName   string
+	OperationAction string
 }
 
 type ConfigurationSpec struct {
@@ -92,6 +93,7 @@ type ConfigurationSpec struct {
 	NameResolutionSpec NameResolutionSpec `json:"nameResolution,omitempty" yaml:"nameResolution,omitempty"`
 	Features           []FeatureSpec      `json:"features,omitempty" yaml:"features,omitempty"`
 	APISpec            APISpec            `json:"api,omitempty" yaml:"api,omitempty"`
+	ComponentsSpec     ComponentsSpec     `json:"components,omitempty" yaml:"components,omitempty"`
 }
 
 type SecretsSpec struct {
@@ -142,11 +144,19 @@ type TracingSpec struct {
 	SamplingRate string     `json:"samplingRate" yaml:"samplingRate"`
 	Stdout       bool       `json:"stdout" yaml:"stdout"`
 	Zipkin       ZipkinSpec `json:"zipkin" yaml:"zipkin"`
+	Otel         OtelSpec   `json:"otel" yaml:"otel"`
 }
 
-// ZipkinSpec defines Zipkin trace configurations.
+// ZipkinSpec defines Zipkin exporter configurations.
 type ZipkinSpec struct {
 	EndpointAddress string `json:"endpointAddress" yaml:"endpointAddress"`
+}
+
+// OtelSpec defines Otel exporter configurations.
+type OtelSpec struct {
+	Protocol        string `json:"protocol" yaml:"protocol"`
+	EndpointAddress string `json:"endpointAddress" yaml:"endpointAddress"`
+	IsSecure        bool   `json:"isSecure" yaml:"isSecure"`
 }
 
 // MetricSpec configuration for metrics.
@@ -202,12 +212,21 @@ type FeatureSpec struct {
 	Enabled bool    `json:"enabled" yaml:"enabled"`
 }
 
+// ComponentsSpec describes the configuration for Dapr components
+type ComponentsSpec struct {
+	// Denylist of component types that cannot be instantiated
+	Deny []string `json:"deny,omitempty" yaml:"deny,omitempty"`
+}
+
 // LoadDefaultConfiguration returns the default config.
 func LoadDefaultConfiguration() *Configuration {
 	return &Configuration{
 		Spec: ConfigurationSpec{
 			TracingSpec: TracingSpec{
 				SamplingRate: "",
+				Otel: OtelSpec{
+					IsSecure: true,
+				},
 			},
 			MetricSpec: MetricSpec{
 				Enabled: true,
@@ -245,15 +264,18 @@ func LoadStandaloneConfiguration(config string) (*Configuration, string, error) 
 		return nil, string(b), err
 	}
 
+	noDefaultContentTypeValue = IsFeatureEnabled(conf.Spec.Features, NoDefaultContentType)
+
 	return conf, string(b), nil
 }
 
 // LoadKubernetesConfiguration gets configuration from the Kubernetes operator with a given name.
-func LoadKubernetesConfiguration(config, namespace string, operatorClient operatorv1pb.OperatorClient) (*Configuration, error) {
+func LoadKubernetesConfiguration(config, namespace string, podName string, operatorClient operatorv1pb.OperatorClient) (*Configuration, error) {
 	resp, err := operatorClient.GetConfiguration(context.Background(), &operatorv1pb.GetConfigurationRequest{
 		Name:      config,
 		Namespace: namespace,
-	}, grpc_retry.WithMax(operatorMaxRetries), grpc_retry.WithPerRetryTimeout(operatorCallTimeout))
+		PodName:   podName,
+	}, grpcRetry.WithMax(operatorMaxRetries), grpcRetry.WithPerRetryTimeout(operatorCallTimeout))
 	if err != nil {
 		return nil, err
 	}
@@ -270,6 +292,8 @@ func LoadKubernetesConfiguration(config, namespace string, operatorClient operat
 	if err != nil {
 		return nil, err
 	}
+
+	noDefaultContentTypeValue = IsFeatureEnabled(conf.Spec.Features, NoDefaultContentType)
 
 	return conf, nil
 }
@@ -301,7 +325,7 @@ func sortAndValidateSecretsConfiguration(conf *Configuration) error {
 // IsSecretAllowed Check if the secret is allowed to be accessed.
 func (c SecretsScope) IsSecretAllowed(key string) bool {
 	// By default, set allow access for the secret store.
-	var access string = AllowAccess
+	access := AllowAccess
 	// Check and set deny access.
 	if strings.EqualFold(c.DefaultAccess, DenyAccess) {
 		access = DenyAccess
@@ -336,4 +360,16 @@ func IsFeatureEnabled(features []FeatureSpec, target Feature) bool {
 		}
 	}
 	return false
+}
+
+// GetNoDefaultContentType returns the value of the noDefaultContentType flag.
+// It requires the configuration to be loaded, otherwise it returns false.
+func GetNoDefaultContentType() bool {
+	return noDefaultContentTypeValue
+}
+
+// SetNoDefaultContentType sets the value of noDefaultContentTypeValue.
+// This should only be used for testing.
+func SetNoDefaultContentType(val bool) {
+	noDefaultContentTypeValue = val
 }

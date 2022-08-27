@@ -6,9 +6,9 @@ metadata:
     app: dapr-placement-server
 spec:
 {{- if eq .Values.global.ha.enabled true }}
-  replicas: {{ .Values.global.ha.replicaCount }}
+  replicas: 3
 {{- else }}
-  replicas: {{ .Values.replicaCount }}
+  replicas: 1
 {{- end }}
   serviceName: dapr-placement-server
   podManagementPolicy: Parallel
@@ -46,7 +46,7 @@ spec:
           initialDelaySeconds: {{ .Values.debug.initialDelaySeconds }}
 {{- end }}
           periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
-          failureThreshold: 5
+          failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
         readinessProbe:
           httpGet:
             path: /healthz
@@ -57,7 +57,7 @@ spec:
           initialDelaySeconds: {{ .Values.debug.initialDelaySeconds }}
 {{- end }}
           periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
-          failureThreshold: 5
+          failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
 {{- if contains "/" .Values.image.name }}
         image: "{{ .Values.image.name }}"
 {{- else }}

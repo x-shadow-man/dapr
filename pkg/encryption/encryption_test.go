@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"testing"
 
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/secretstores"
 	"github.com/dapr/dapr/pkg/apis/components/v1alpha1"
 
@@ -87,15 +88,15 @@ func TestComponentEncryptionKey(t *testing.T) {
 
 		rand.Read(bytes)
 
-		secondaryKey := hex.EncodeToString(bytes)
+		secondaryKey := hex.EncodeToString(bytes[:16]) // 128-bit key
 
 		secretStore := &mockSecretStore{}
-		secretStore.Init(secretstores.Metadata{
+		secretStore.Init(secretstores.Metadata{Base: metadata.Base{
 			Properties: map[string]string{
 				"primaryKey":   primaryKey,
 				"secondaryKey": secondaryKey,
 			},
-		})
+		}})
 
 		keys, err := ComponentEncryptionKey(component, secretStore)
 		assert.NoError(t, err)
@@ -154,12 +155,12 @@ func TestComponentEncryptionKey(t *testing.T) {
 func TestTryGetEncryptionKeyFromMetadataItem(t *testing.T) {
 	t.Run("no secretRef on valid item", func(t *testing.T) {
 		secretStore := &mockSecretStore{}
-		secretStore.Init(secretstores.Metadata{
+		secretStore.Init(secretstores.Metadata{Base: metadata.Base{
 			Properties: map[string]string{
 				"primaryKey":   "123",
 				"secondaryKey": "456",
 			},
-		})
+		}})
 
 		_, err := tryGetEncryptionKeyFromMetadataItem("", v1alpha1.MetadataItem{}, secretStore)
 		assert.Error(t, err)
@@ -168,25 +169,81 @@ func TestTryGetEncryptionKeyFromMetadataItem(t *testing.T) {
 
 func TestCreateCipher(t *testing.T) {
 	t.Run("invalid key", func(t *testing.T) {
-		gcm, err := createCipher(Key{
+		cipherObj, err := createCipher(Key{
 			Key: "123",
-		}, AES256Algorithm)
+		}, AESGCMAlgorithm)
 
-		assert.Nil(t, gcm)
+		assert.Nil(t, cipherObj)
 		assert.Error(t, err)
 	})
 
-	t.Run("valid key", func(t *testing.T) {
+	t.Run("valid 256-bit key", func(t *testing.T) {
 		bytes := make([]byte, 32)
 		rand.Read(bytes)
 
 		key := hex.EncodeToString(bytes)
 
-		gcm, err := createCipher(Key{
+		cipherObj, err := createCipher(Key{
 			Key: key,
-		}, AES256Algorithm)
+		}, AESGCMAlgorithm)
 
-		assert.NotNil(t, gcm)
+		assert.NotNil(t, cipherObj)
 		assert.NoError(t, err)
+	})
+
+	t.Run("valid 192-bit key", func(t *testing.T) {
+		bytes := make([]byte, 24)
+		rand.Read(bytes)
+
+		key := hex.EncodeToString(bytes)
+
+		cipherObj, err := createCipher(Key{
+			Key: key,
+		}, AESGCMAlgorithm)
+
+		assert.NotNil(t, cipherObj)
+		assert.NoError(t, err)
+	})
+
+	t.Run("valid 128-bit key", func(t *testing.T) {
+		bytes := make([]byte, 16)
+		rand.Read(bytes)
+
+		key := hex.EncodeToString(bytes)
+
+		cipherObj, err := createCipher(Key{
+			Key: key,
+		}, AESGCMAlgorithm)
+
+		assert.NotNil(t, cipherObj)
+		assert.NoError(t, err)
+	})
+
+	t.Run("invalid key size", func(t *testing.T) {
+		bytes := make([]byte, 18)
+		rand.Read(bytes)
+
+		key := hex.EncodeToString(bytes)
+
+		cipherObj, err := createCipher(Key{
+			Key: key,
+		}, AESGCMAlgorithm)
+
+		assert.Nil(t, cipherObj)
+		assert.Error(t, err)
+	})
+
+	t.Run("invalid algorithm", func(t *testing.T) {
+		bytes := make([]byte, 32)
+		rand.Read(bytes)
+
+		key := hex.EncodeToString(bytes)
+
+		cipherObj, err := createCipher(Key{
+			Key: key,
+		}, "3DES")
+
+		assert.Nil(t, cipherObj)
+		assert.Error(t, err)
 	})
 }

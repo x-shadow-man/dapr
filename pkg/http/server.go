@@ -30,15 +30,18 @@ import (
 	"github.com/valyala/fasthttp/pprofhandler"
 
 	"github.com/dapr/dapr/pkg/config"
-	cors_dapr "github.com/dapr/dapr/pkg/cors"
+	corsDapr "github.com/dapr/dapr/pkg/cors"
 	diag "github.com/dapr/dapr/pkg/diagnostics"
-	diag_utils "github.com/dapr/dapr/pkg/diagnostics/utils"
-	http_middleware "github.com/dapr/dapr/pkg/middleware/http"
+	diagUtils "github.com/dapr/dapr/pkg/diagnostics/utils"
+	httpMiddleware "github.com/dapr/dapr/pkg/middleware/http"
 	auth "github.com/dapr/dapr/pkg/runtime/security"
 	"github.com/dapr/kit/logger"
 )
 
-var log = logger.NewLogger("dapr.runtime.http")
+var (
+	log     = logger.NewLogger("dapr.runtime.http")
+	infoLog = logger.NewLogger("dapr.runtime.http-info")
+)
 
 const protocol = "http"
 
@@ -52,35 +55,50 @@ type server struct {
 	config             ServerConfig
 	tracingSpec        config.TracingSpec
 	metricSpec         config.MetricSpec
-	pipeline           http_middleware.Pipeline
+	pipeline           httpMiddleware.Pipeline
 	api                API
 	apiSpec            config.APISpec
 	servers            []*fasthttp.Server
 	profilingListeners []net.Listener
 }
 
+// NewServerOpts are the options for NewServer.
+type NewServerOpts struct {
+	API         API
+	Config      ServerConfig
+	TracingSpec config.TracingSpec
+	MetricSpec  config.MetricSpec
+	Pipeline    httpMiddleware.Pipeline
+	APISpec     config.APISpec
+}
+
 // NewServer returns a new HTTP server.
-func NewServer(api API, config ServerConfig, tracingSpec config.TracingSpec, metricSpec config.MetricSpec, pipeline http_middleware.Pipeline, apiSpec config.APISpec) Server {
+func NewServer(opts NewServerOpts) Server {
+	infoLog.SetOutputLevel(logger.LogLevel("info"))
 	return &server{
-		api:         api,
-		config:      config,
-		tracingSpec: tracingSpec,
-		metricSpec:  metricSpec,
-		pipeline:    pipeline,
-		apiSpec:     apiSpec,
+		api:         opts.API,
+		config:      opts.Config,
+		tracingSpec: opts.TracingSpec,
+		metricSpec:  opts.MetricSpec,
+		pipeline:    opts.Pipeline,
+		apiSpec:     opts.APISpec,
 	}
 }
 
 // StartNonBlocking starts a new server in a goroutine.
 func (s *server) StartNonBlocking() error {
-	handler :=
-		useAPIAuthentication(
-			s.useCors(
-				s.useComponents(
-					s.useRouter())))
+	handler := useAPIAuthentication(
+		s.useCors(
+			s.useComponents(
+				s.useRouter())))
 
 	handler = s.useMetrics(handler)
 	handler = s.useTracing(handler)
+
+	enableAPILogging := s.config.EnableAPILogging
+	if enableAPILogging {
+		handler = s.apiLoggingInfo(handler)
+	}
 
 	var listeners []net.Listener
 	var profilingListeners []net.Listener
@@ -112,7 +130,6 @@ func (s *server) StartNonBlocking() error {
 			Handler:            handler,
 			MaxRequestBodySize: s.config.MaxRequestBodySize * 1024 * 1024,
 			ReadBufferSize:     s.config.ReadBufferSize * 1024,
-			StreamRequestBody:  s.config.StreamRequestBody,
 		}
 		s.servers = append(s.servers, customServer)
 
@@ -191,7 +208,7 @@ func (s *server) Close() error {
 }
 
 func (s *server) useTracing(next fasthttp.RequestHandler) fasthttp.RequestHandler {
-	if diag_utils.IsTracingEnabled(s.tracingSpec.SamplingRate) {
+	if diagUtils.IsTracingEnabled(s.tracingSpec.SamplingRate) {
 		log.Infof("enabled tracing http middleware")
 		return diag.HTTPTraceMiddleware(next, s.config.AppID, s.tracingSpec)
 	}
@@ -206,6 +223,13 @@ func (s *server) useMetrics(next fasthttp.RequestHandler) fasthttp.RequestHandle
 	}
 
 	return next
+}
+
+func (s *server) apiLoggingInfo(next fasthttp.RequestHandler) fasthttp.RequestHandler {
+	return func(ctx *fasthttp.RequestCtx) {
+		infoLog.Infof("HTTP API Called: %s %s", ctx.Method(), ctx.Path())
+		next(ctx)
+	}
 }
 
 func (s *server) useRouter() fasthttp.RequestHandler {
@@ -227,7 +251,7 @@ func (s *server) useComponents(next fasthttp.RequestHandler) fasthttp.RequestHan
 }
 
 func (s *server) useCors(next fasthttp.RequestHandler) fasthttp.RequestHandler {
-	if s.config.AllowedOrigins == cors_dapr.DefaultAllowedOrigins {
+	if s.config.AllowedOrigins == corsDapr.DefaultAllowedOrigins {
 		return next
 	}
 
@@ -313,7 +337,7 @@ func (s *server) getRouter(endpoints []Endpoint) *routing.Router {
 func (s *server) handle(e Endpoint, parameterFinder *regexp.Regexp, path string, router *routing.Router) {
 	for _, m := range e.Methods {
 		pathIncludesParameters := parameterFinder.MatchString(path)
-		if pathIncludesParameters {
+		if pathIncludesParameters && !e.KeepParamUnescape {
 			router.Handle(m, path, s.unescapeRequestParametersHandler(e.Handler))
 		} else {
 			router.Handle(m, path, e.Handler)

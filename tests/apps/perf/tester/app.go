@@ -32,6 +32,8 @@ type TestParameters struct {
 	PayloadSizeKB     int    `json:"payloadSizeKB"`
 	Payload           string `json:"payload"`
 	StdClient         bool   `json:"stdClient"`
+	Grpc              bool   `json:"grpc"`
+	Dapr              string `json:"dapr"`
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -78,6 +80,20 @@ func main() {
 // runTest accepts a set of test parameters, runs Fortio with the configured setting and returns
 // the test results in json format.
 func runTest(params TestParameters) ([]byte, error) {
+	args := buildFortioArgs(params)
+	fmt.Printf("running test with params: %s", args)
+
+	cmd := exec.Command("fortio", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	if err != nil {
+		return nil, err
+	}
+	return os.ReadFile("result.json")
+}
+
+func buildFortioArgs(params TestParameters) []string {
 	var args []string
 
 	if len(params.Payload) > 0 {
@@ -94,15 +110,14 @@ func runTest(params TestParameters) ([]byte, error) {
 	if params.StdClient {
 		args = append(args, "-stdclient")
 	}
-	args = append(args, params.TargetEndpoint)
-	fmt.Printf("running test with params: %s", args)
 
-	cmd := exec.Command("fortio", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
-	if err != nil {
-		return nil, err
+	if params.Grpc {
+		args = append(args, "-grpc")
 	}
-	return os.ReadFile("result.json")
+	if params.Dapr != "" {
+		args = append(args, "-dapr", params.Dapr)
+	}
+
+	args = append(args, params.TargetEndpoint)
+	return args
 }

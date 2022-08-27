@@ -11,7 +11,7 @@ import (
 	"github.com/phayes/freeport"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
-	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/dapr/dapr/pkg/apis/components/v1alpha1"
 	subscriptions "github.com/dapr/dapr/pkg/apis/subscriptions/v1alpha1"
@@ -30,6 +30,9 @@ func (o *mockOperator) GetConfiguration(ctx context.Context, in *operatorv1pb.Ge
 func (o *mockOperator) ListComponents(ctx context.Context, in *operatorv1pb.ListComponentsRequest) (*operatorv1pb.ListComponentResponse, error) {
 	component := v1alpha1.Component{}
 	component.ObjectMeta.Name = "test"
+	component.ObjectMeta.Labels = map[string]string{
+		"podName": in.PodName,
+	}
 	component.Spec = v1alpha1.ComponentSpec{
 		Type: "testtype",
 	}
@@ -40,7 +43,7 @@ func (o *mockOperator) ListComponents(ctx context.Context, in *operatorv1pb.List
 	}, nil
 }
 
-func (o *mockOperator) ListSubscriptions(ctx context.Context, in *emptypb.Empty) (*operatorv1pb.ListSubscriptionsResponse, error) {
+func (o *mockOperator) ListSubscriptionsV2(ctx context.Context, in *operatorv1pb.ListSubscriptionsRequest) (*operatorv1pb.ListSubscriptionsResponse, error) {
 	subscription := subscriptions.Subscription{}
 	subscription.ObjectMeta.Name = "test"
 	subscription.Spec = subscriptions.SubscriptionSpec{
@@ -55,12 +58,12 @@ func (o *mockOperator) ListSubscriptions(ctx context.Context, in *emptypb.Empty)
 	}, nil
 }
 
-func (o *mockOperator) ComponentUpdate(in *operatorv1pb.ComponentUpdateRequest, srv operatorv1pb.Operator_ComponentUpdateServer) error {
+func (o *mockOperator) ComponentUpdate(in *operatorv1pb.ComponentUpdateRequest, srv operatorv1pb.Operator_ComponentUpdateServer) error { //nolint:nosnakecase
 	return nil
 }
 
 func getOperatorClient(address string) operatorv1pb.OperatorClient {
-	conn, _ := grpc.Dial(address, grpc.WithInsecure())
+	conn, _ := grpc.Dial(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	return operatorv1pb.NewOperatorClient(conn)
 }
 
@@ -84,6 +87,7 @@ func TestLoadComponents(t *testing.T) {
 		config: config.KubernetesConfig{
 			ControlPlaneAddress: fmt.Sprintf("localhost:%v", port),
 		},
+		podName: "testPodName",
 	}
 
 	response, err := request.LoadComponents()
@@ -91,4 +95,5 @@ func TestLoadComponents(t *testing.T) {
 	assert.NotNil(t, response)
 	assert.Equal(t, "test", response[0].Name)
 	assert.Equal(t, "testtype", response[0].Spec.Type)
+	assert.Equal(t, "testPodName", response[0].ObjectMeta.Labels["podName"])
 }

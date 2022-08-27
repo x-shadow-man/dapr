@@ -14,10 +14,6 @@ limitations under the License.
 package main
 
 import (
-	actor_cl "actorload/pkg/actor/client"
-	cl "actorload/pkg/actor/client"
-	http_client "actorload/pkg/actor/client/http"
-
 	"errors"
 	"flag"
 	"fmt"
@@ -25,6 +21,10 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	actor_cl "actorload/pkg/actor/client"
+	cl "actorload/pkg/actor/client"
+	http_client "actorload/pkg/actor/client/http"
 
 	"fortio.org/fortio/log"
 	"fortio.org/fortio/periodic"
@@ -112,7 +112,7 @@ type actorLoadTestOptions struct {
 }
 
 func generatePayload(length int) []byte {
-	var chs = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+	chs := []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 
 	payload := make([]byte, length)
 	for i := range payload {
@@ -123,7 +123,7 @@ func generatePayload(length int) []byte {
 }
 
 func activateRandomActors(client actor_cl.ActorClient, actorType string, maxActor int) []string {
-	var activatedActors = []string{}
+	activatedActors := []string{}
 	for i := 0; i < maxActor; i++ {
 		actorID := strings.Replace(uuid.New().String(), "-", "", -1)
 		log.Infof("Request to activate %s.%s actor", actorType, actorID)

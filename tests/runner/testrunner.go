@@ -18,6 +18,9 @@ import (
 	"log"
 	"os"
 
+	corev1 "k8s.io/api/core/v1"
+
+	configurationv1alpha1 "github.com/dapr/dapr/pkg/apis/configuration/v1alpha1"
 	kube "github.com/dapr/dapr/tests/platforms/kubernetes"
 )
 
@@ -45,6 +48,8 @@ type PlatformInterface interface {
 	GetAppUsage(appName string) (*AppUsage, error)
 	GetSidecarUsage(appName string) (*AppUsage, error)
 	GetTotalRestarts(appname string) (int, error)
+	GetConfiguration(name string) (*configurationv1alpha1.Configuration, error)
+	GetService(name string) (*corev1.Service, error)
 }
 
 // AppUsage holds the CPU and Memory information for the application.
@@ -74,7 +79,8 @@ type TestRunner struct {
 // NewTestRunner returns TestRunner instance for e2e test.
 func NewTestRunner(id string, apps []kube.AppDescription,
 	comps []kube.ComponentDescription,
-	initApps []kube.AppDescription) *TestRunner {
+	initApps []kube.AppDescription,
+) *TestRunner {
 	return &TestRunner{
 		id:         id,
 		components: comps,

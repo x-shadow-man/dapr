@@ -19,7 +19,6 @@ limitations under the License.
 // https://research.googleblog.com/2017/04/consistent-hashing-with-bounded-loads.html
 //
 // https://github.com/lafikl/consistent/blob/master/consistent.go
-//
 package hashing
 
 import (
@@ -99,12 +98,12 @@ func NewFromExisting(hosts map[uint64]string, sortedSet []uint64, loadMap map[st
 	}
 }
 
-// GetInternals returns the internal data structure of the consistent hash.
-func (c *Consistent) GetInternals() (map[uint64]string, []uint64, map[string]*Host, int64) {
+// ReadInternals returns the internal data structure of the consistent hash.
+func (c *Consistent) ReadInternals(reader func(map[uint64]string, []uint64, map[string]*Host, int64)) {
 	c.RLock()
 	defer c.RUnlock()
 
-	return c.hosts, c.sortedSet, c.loadMap, c.totalLoad
+	reader(c.hosts, c.sortedSet, c.loadMap, c.totalLoad)
 }
 
 // Add adds a host with port to the table.
@@ -165,7 +164,6 @@ func (c *Consistent) GetHost(key string) (*Host, error) {
 // to pick the least loaded host that can serve the key
 //
 // It returns ErrNoHosts if the ring has no hosts in it.
-//
 func (c *Consistent) GetLeast(key string) (string, error) {
 	c.RLock()
 	defer c.RUnlock()
